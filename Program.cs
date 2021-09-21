@@ -39,17 +39,27 @@ async Task GetKitInfoFromKitDirectory()
 
     await page.SelectOptionAsync("[name=club_kits_table_length]", "100");
 
-    var tableHtml = "dummy1";
-    var previousHtml = "dummy2";
+    int currentPage = 0;
+    int maxPage = 5;
 
-    var allTasks = new List<Task>();
- 
     do
     {
-        previousHtml = tableHtml;
         await page.WaitForResponseAsync(resp => resp.Url.Contains("zuvvi")); // Thumbnail requests hit /zuvvi/ paths
 
-        tableHtml = await page.GetInnerHtmlAsync("#club_kits_table");
+        int loadedPage = await GetCurrentPageNumber(page);
+
+        // Sometimes page load takes a while - loop
+        while (loadedPage == currentPage)
+        {
+            Console.WriteLine("Looping for page to load");
+            loadedPage = await GetCurrentPageNumber(page);
+        }
+
+        maxPage = await GetMaxPageNumberShowing(page);
+        currentPage = loadedPage;
+
+        // Grab the table, and parse out the kit URLs
+        var tableHtml = await page.GetInnerHtmlAsync("#club_kits_table");
         var document = new HtmlDocument();
         document.LoadHtml(tableHtml);
         var kitForPage = document.DocumentNode.SelectNodes("//tbody/tr").Select(row =>
@@ -59,17 +69,39 @@ async Task GetKitInfoFromKitDirectory()
             var kit = columns[4].SelectNodes(".//a").Select(a => a.GetAttributeValue("data-href", null)).Select(stub => Url.Parse(Url.Combine(bcUrl, stub)));
             var kitInfo = new ClubKitInfo { ClubName = name, KitImageUrls = kit.ToList() };
             results.Add(kitInfo);
-            Console.WriteLine(name);
-            Console.WriteLine(string.Join(",", kit));
-            Console.WriteLine();
             return kitInfo;
         });
 
-        var downloadTasks = kitForPage.Distinct().Select(kit => DownloadKitForClub(kit, cookies)).ToList();
+        // Download the kit
+        var downloadTasks = kitForPage.DistinctBy(d => d.ClubName).Select(kit => DownloadKitForClub(kit, cookies)).ToList();
         await Task.WhenAll(downloadTasks);
+        Console.WriteLine($"Downloaded {downloadTasks.Count} kit photos on page {currentPage}");
         await page.ClickAsync("#club_kits_table_next");
-    } while (previousHtml != tableHtml);
+    } while (currentPage != maxPage);
+
 }
+
+async Task<int> GetMaxPageNumberShowing(IPage page)
+{
+    var buttons = await GetButtonsAsync(page);
+    return await buttons.ToAsyncEnumerable().MaxAwaitAsync(async b =>
+    {
+        var text = await b.GetInnerTextAsync();
+        return int.Parse(text);
+    });
+}
+
+async Task<int> GetCurrentPageNumber(IPage page)
+{
+    var buttons = await GetButtonsAsync(page);
+    return await buttons.ToAsyncEnumerable().WhereAwait(async b =>
+    {
+        var @class = await b.GetAttributeAsync("class");
+        return @class.Contains("button--active");
+    }).SelectAwait(async b => int.Parse(await b.GetInnerTextAsync())).SingleAsync();
+}
+
+async Task<IEnumerable<IElementHandle>> GetButtonsAsync(IPage page) => await page.QuerySelectorAllAsync("//ul[@class ='pagination']//a");
 
 async Task DownloadKitForClub(ClubKitInfo info, IEnumerable<NetworkCookie> cookies)
 {
@@ -82,7 +114,10 @@ async Task DownloadKitForClub(ClubKitInfo info, IEnumerable<NetworkCookie> cooki
     for (int i = 0; i < info.KitImageUrls.Count; i++)
     {
         var url = info.KitImageUrls[i];
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        var request = new HttpRequestMessage(HttpMethod.Get, url)
+        {
+            Version = new Version(2, 0)
+        };
 
         request.Headers.Add("Cookie", cookies.Select(c => $"{c.Name}={c.Value};"));
         using (var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead))
@@ -110,5 +145,5 @@ async Task DownloadKitForClub(ClubKitInfo info, IEnumerable<NetworkCookie> cooki
 public record ClubKitInfo
 {
     public string ClubName { get; init; }
-    public List<Url> KitImageUrls { get; set; }
+    public IReadOnlyList<Url> KitImageUrls { get; init; }
 }
